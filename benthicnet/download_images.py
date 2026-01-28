@@ -28,6 +28,7 @@ from benthicnet import __version__
 DEFAULT_MIN_INTERVAL = 0.1  # 100ms between requests to same domain
 PANGAEA_MIN_INTERVAL = 0.167  # pangaea.de: max 180 requests per 30 seconds
 PANGAEA_COOLDOWN = 30
+FRDR_MIN_INTERVAL = 1.0  # frdr-dfdr.ca: slow server, 1 request per second
 MAX_RETRY_ATTEMPTS = 5
 RETRYABLE_STATUS_CODES = {429, 500, 503}
 DEFAULT_CONCURRENT_DOWNLOADS = 8
@@ -56,6 +57,8 @@ class DomainRateLimiter:
         """Get minimum interval for a domain."""
         if "pangaea.de" in domain:
             return PANGAEA_MIN_INTERVAL
+        if "frdr-dfdr.ca" in domain:
+            return FRDR_MIN_INTERVAL
         return DEFAULT_MIN_INTERVAL
 
     async def acquire(self, url: str) -> None:
@@ -162,15 +165,25 @@ async def _download_with_retry(client, url, rate_limiter, verbose=1, innerpad=""
     """
     response = None
 
+    last_error = None
+
     for attempt in range(MAX_RETRY_ATTEMPTS):
         await rate_limiter.acquire(url)
 
         try:
             response = await client.get(url)
         except httpx.RequestError as err:
-            print(f"Error while handling: {url}")
-            print(err)
-            return None
+            last_error = err
+            wait_time = float(2**attempt)
+            if verbose >= 1:
+                err_type = type(err).__name__
+                err_msg = str(err) or "(no details)"
+                print(
+                    f"{innerpad}Connection error ({err_type}: {err_msg}), "
+                    f"retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRY_ATTEMPTS}): {url}"
+                )
+            await asyncio.sleep(wait_time)
+            continue
 
         if response.status_code not in RETRYABLE_STATUS_CODES:
             return response
@@ -190,6 +203,13 @@ async def _download_with_retry(client, url, rate_limiter, verbose=1, innerpad=""
                 f"(HTTP Status {response.status_code}): {url}"
             )
         await asyncio.sleep(wait_time)
+
+    # All retries exhausted
+    if last_error is not None:
+        err_type = type(last_error).__name__
+        err_msg = str(last_error) or "(no details)"
+        print(f"Failed after {MAX_RETRY_ATTEMPTS} attempts ({err_type}: {err_msg}): {url}")
+        return None
 
     return response
 
@@ -262,43 +282,6 @@ def _validate_image(file_path, url):
         print(f"Error while handling: {url}")
         print(err)
         return False
-
-
-def _format_progress(processed, total, elapsed_time, downloads):
-    """
-    Format a progress message for the download process.
-
-    Parameters
-    ----------
-    processed : int
-        Number of URLs processed so far.
-    total : int
-        Total number of URLs to process.
-    elapsed_time : float
-        Time elapsed since start in seconds.
-    downloads : int
-        Number of successful downloads so far.
-
-    Returns
-    -------
-    str
-        Formatted progress message.
-    """
-    percent = 100 * processed / total
-    remaining = total - processed
-
-    if downloads > 0:
-        time_remaining = elapsed_time / downloads * remaining
-    else:
-        time_remaining = elapsed_time / processed * remaining
-
-    elapsed_str = str(datetime.timedelta(seconds=int(elapsed_time)))
-    remaining_str = str(datetime.timedelta(seconds=int(time_remaining)))
-
-    return (
-        f"Processed {processed:4d}/{total} urls ({percent:6.2f}%) "
-        f"in {elapsed_str} (approx. {remaining_str} remaining)"
-    )
 
 
 def _format_summary(n_already, n_errors, n_downloaded, total):
@@ -489,7 +472,7 @@ async def _download_images_async(
 
     with tempfile.TemporaryDirectory() as temp_dir:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0, connect=10.0),
+            timeout=httpx.Timeout(60.0, connect=30.0),
             follow_redirects=True,
             limits=httpx.Limits(max_connections=max_concurrent * 2),
         ) as client:
