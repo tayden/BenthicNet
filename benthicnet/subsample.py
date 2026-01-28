@@ -17,7 +17,7 @@ import tqdm
 
 import benthicnet.io
 import benthicnet.utils
-from benthicnet import __meta__
+from benthicnet import __version__
 
 from .kde_tools import EARTH_RADIUS
 
@@ -836,7 +836,7 @@ def get_parser():
         "--version",
         "-V",
         action="version",
-        version="%(prog)s {version}".format(version=__meta__.version),
+        version=f"%(prog)s {__version__}",
         help="Show program's version number and exit.",
     )
     parser.add_argument(

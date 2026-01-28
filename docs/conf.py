@@ -24,21 +24,22 @@ REPO_DIRECTORY = os.path.dirname(DOCS_DIRECTORY)
 sys.path.insert(0, DOCS_DIRECTORY)
 sys.path.insert(0, REPO_DIRECTORY)
 
-from benthicnet import __meta__ as meta  # noqa: E402 isort:skip
+from importlib.metadata import metadata  # noqa: E402 isort:skip
 
+_meta = metadata("benthicnet")
 
 # -- Project information -----------------------------------------------------
 
 now = datetime.datetime.now()
 
-project = meta.name
-project_path = meta.path
-author = meta.author
+project = _meta["Name"]
+project_path = project.lower().replace("-", "_").replace(" ", "_")
+author = _meta["Author-email"].split("<")[0].strip()
 copyright = "{}, {}".format(now.year, author)
 
 
 # The full version, including alpha/beta/rc tags
-release = meta.version
+release = _meta["Version"]
 # The short X.Y version
 version = ".".join(release.split(".")[0:2])
 
@@ -282,7 +283,7 @@ latex_elements = {
 # (source start file, target name, title,
 #  author, documentclass [howto, manual, or own class]).
 latex_documents = [
-    (master_doc, project + ".tex", project + " Documentation", meta.author, "manual"),
+    (master_doc, project + ".tex", project + " Documentation", author, "manual"),
 ]
 
 
@@ -305,7 +306,7 @@ texinfo_documents = [
         project + " Documentation",
         author,
         project,
-        meta.description,
+        _meta["Summary"],
         "Miscellaneous",
     ),
 ]

@@ -1,3 +1,3 @@
-from . import __meta__
+from importlib.metadata import version
 
-__version__ = __meta__.version
+__version__ = version("benthicnet")

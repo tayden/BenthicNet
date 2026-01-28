@@ -4,28 +4,103 @@
 Downloading BenthicNet images from CSV file.
 """
 
+import asyncio
 import datetime
 import os
 import shutil
 import sys
 import tempfile
 import time
+from collections import defaultdict
 from pathlib import Path
+from urllib.parse import urlparse
 
+import httpx
 import numpy as np
 import pandas as pd
 import PIL.Image
-import requests
 import tqdm
 
 import benthicnet.io
-from benthicnet import __meta__
+from benthicnet import __version__
 
-# Rate limiting for pangaea.de: max 180 requests per 30 seconds
-PANGAEA_MIN_INTERVAL = 0.167
+# Rate limiting defaults
+DEFAULT_MIN_INTERVAL = 0.1  # 100ms between requests to same domain
+PANGAEA_MIN_INTERVAL = 0.167  # pangaea.de: max 180 requests per 30 seconds
 PANGAEA_COOLDOWN = 30
 MAX_RETRY_ATTEMPTS = 5
 RETRYABLE_STATUS_CODES = {429, 500, 503}
+DEFAULT_CONCURRENT_DOWNLOADS = 8
+
+
+class DomainRateLimiter:
+    """
+    Rate limiter that enforces per-domain request intervals.
+
+    Tracks the last request time for each domain and enforces minimum
+    intervals between requests. Also tracks domains that have returned
+    Retry-After headers and blocks requests until that time passes.
+    """
+
+    def __init__(self):
+        self._last_request: dict[str, float] = defaultdict(float)
+        self._retry_until: dict[str, float] = defaultdict(float)
+        self._lock = asyncio.Lock()
+
+    def _get_domain(self, url: str) -> str:
+        """Extract domain from URL."""
+        parsed = urlparse(url)
+        return parsed.netloc.lower()
+
+    def _get_min_interval(self, domain: str) -> float:
+        """Get minimum interval for a domain."""
+        if "pangaea.de" in domain:
+            return PANGAEA_MIN_INTERVAL
+        return DEFAULT_MIN_INTERVAL
+
+    async def acquire(self, url: str) -> None:
+        """
+        Wait until it's safe to make a request to the given URL's domain.
+
+        Parameters
+        ----------
+        url : str
+            The URL to be requested.
+        """
+        domain = self._get_domain(url)
+        min_interval = self._get_min_interval(domain)
+
+        async with self._lock:
+            now = time.time()
+
+            # Check if we're in a Retry-After cooldown period
+            retry_until = self._retry_until[domain]
+            if now < retry_until:
+                wait_time = retry_until - now
+                await asyncio.sleep(wait_time)
+                now = time.time()
+
+            # Check minimum interval since last request
+            last_request = self._last_request[domain]
+            elapsed = now - last_request
+            if elapsed < min_interval:
+                await asyncio.sleep(min_interval - elapsed)
+
+            self._last_request[domain] = time.time()
+
+    def set_retry_after(self, url: str, seconds: float) -> None:
+        """
+        Set a Retry-After cooldown for a domain.
+
+        Parameters
+        ----------
+        url : str
+            The URL that returned the Retry-After header.
+        seconds : float
+            Number of seconds to wait before retrying.
+        """
+        domain = self._get_domain(url)
+        self._retry_until[domain] = time.time() + seconds
 
 
 def _calculate_wait_time(response, attempt, url):
@@ -34,7 +109,7 @@ def _calculate_wait_time(response, attempt, url):
 
     Parameters
     ----------
-    response : requests.Response
+    response : httpx.Response
         The HTTP response object.
     attempt : int
         Current retry attempt number (0-indexed).
@@ -43,15 +118,15 @@ def _calculate_wait_time(response, attempt, url):
 
     Returns
     -------
-    int
+    float
         Number of seconds to wait before retrying.
     """
     retry_after = response.headers.get("Retry-After", "")
     if retry_after:
         try:
-            return int(retry_after)
+            return float(retry_after)
         except ValueError:
-            return 30
+            return 30.0
 
     if response.status_code == 429:
         return PANGAEA_COOLDOWN
@@ -60,19 +135,21 @@ def _calculate_wait_time(response, attempt, url):
         return PANGAEA_COOLDOWN
 
     # Exponential backoff for other server errors
-    return 2**attempt
+    return float(2**attempt)
 
 
-def _download_with_retry(session, url, verbose=1, innerpad=""):
+async def _download_with_retry(client, url, rate_limiter, verbose=1, innerpad=""):
     """
     Download a URL with retry logic for rate limiting and server errors.
 
     Parameters
     ----------
-    session : requests.Session
-        The requests session to use for connection pooling.
+    client : httpx.AsyncClient
+        The async HTTP client to use.
     url : str
         The URL to download.
+    rate_limiter : DomainRateLimiter
+        Rate limiter for per-domain throttling.
     verbose : int, optional
         Verbosity level. Default is ``1``.
     innerpad : str, optional
@@ -80,23 +157,17 @@ def _download_with_retry(session, url, verbose=1, innerpad=""):
 
     Returns
     -------
-    requests.Response or None
+    httpx.Response or None
         The Response object, or None if request failed due to an exception.
     """
-    last_request_time = 0.0
     response = None
 
     for attempt in range(MAX_RETRY_ATTEMPTS):
-        # Rate limiting for pangaea.de
-        if "pangaea.de/" in url:
-            elapsed = time.time() - last_request_time
-            if elapsed < PANGAEA_MIN_INTERVAL:
-                time.sleep(PANGAEA_MIN_INTERVAL - elapsed)
+        await rate_limiter.acquire(url)
 
         try:
-            response = session.get(url, stream=True)
-            last_request_time = time.time()
-        except requests.exceptions.RequestException as err:
+            response = await client.get(url)
+        except httpx.RequestError as err:
             print(f"Error while handling: {url}")
             print(err)
             return None
@@ -105,6 +176,9 @@ def _download_with_retry(session, url, verbose=1, innerpad=""):
             return response
 
         wait_time = _calculate_wait_time(response, attempt, url)
+
+        # Register the retry delay with the rate limiter
+        rate_limiter.set_retry_after(url, wait_time)
 
         retry_after = response.headers.get("Retry-After", "")
         if verbose >= 1 and retry_after:
@@ -115,18 +189,18 @@ def _download_with_retry(session, url, verbose=1, innerpad=""):
                 f"{innerpad}Retrying in {wait_time} seconds "
                 f"(HTTP Status {response.status_code}): {url}"
             )
-        time.sleep(wait_time)
+        await asyncio.sleep(wait_time)
 
     return response
 
 
-def _save_image_to_temp(response, url, temp_dir, verbose=1, innerpad=""):
+async def _save_image_to_temp(response, url, temp_dir, verbose=1, innerpad=""):
     """
     Save response content to a temporary file.
 
     Parameters
     ----------
-    response : requests.Response
+    response : httpx.Response
         The HTTP response with image content.
     url : str
         The original URL (for filename extraction).
@@ -148,14 +222,19 @@ def _save_image_to_temp(response, url, temp_dir, verbose=1, innerpad=""):
     basename = os.path.basename(url.rstrip("/"))
     temp_path = os.path.join(temp_dir, basename)
 
-    with open(temp_path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=1048576):
-            f.write(chunk)
+    content = response.content
+    await asyncio.to_thread(_write_file, temp_path, content)
 
     if verbose >= 4:
         print(f"{innerpad}  Wrote to {temp_path}")
 
     return temp_path
+
+
+def _write_file(path, content):
+    """Write content to a file (sync helper for asyncio.to_thread)."""
+    with open(path, "wb") as f:
+        f.write(content)
 
 
 def _validate_image(file_path, url):
@@ -269,6 +348,199 @@ def _format_summary(n_already, n_errors, n_downloaded, total):
     return " ".join(messages)
 
 
+async def _download_single_image(
+    client,
+    rate_limiter,
+    row,
+    index,
+    i_row,
+    output_dir,
+    temp_dir,
+    skip_existing,
+    check_image,
+    verbose,
+    innerpad,
+):
+    """
+    Download a single image asynchronously.
+
+    Returns
+    -------
+    tuple
+        (i_row, index, status, destination_name) where status is one of:
+        'already_exists', 'downloaded', 'error', 'skipped_url'
+    """
+    url = row["url"]
+
+    # Handle missing URLs
+    if pd.isna(url) or url == "":
+        if verbose >= 2:
+            print(f"{innerpad}Missing URL for entry\n{row}", flush=True)
+        return (i_row, index, "error", None)
+
+    destination = Path(output_dir) / row["dataset"] / row["site"] / row["image"]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    if skip_existing and destination.is_file():
+        if verbose >= 3:
+            print(
+                f"{innerpad}Skipping download of {url}\n"
+                f"{innerpad}Destination exists: {destination}",
+                flush=True,
+            )
+        return (i_row, index, "already_exists", destination.name)
+
+    if verbose >= 2:
+        print(f"{innerpad}Downloading {url} to {destination}", flush=True)
+
+    response = await _download_with_retry(
+        client, url, rate_limiter, verbose=verbose, innerpad=innerpad
+    )
+
+    if response is None:
+        return (i_row, index, "error", None)
+
+    if response.status_code != 200:
+        if verbose >= 1:
+            print(f"{innerpad}Bad URL (HTTP Status {response.status_code}): " f"{url}")
+        return (i_row, index, "error", None)
+
+    # Save to a unique temp file to avoid conflicts
+    temp_subdir = os.path.join(temp_dir, f"img_{i_row}")
+    os.makedirs(temp_subdir, exist_ok=True)
+
+    temp_path = await _save_image_to_temp(
+        response, url, temp_subdir, verbose=verbose, innerpad=innerpad
+    )
+
+    if check_image and not _validate_image(temp_path, url):
+        shutil.rmtree(temp_subdir, ignore_errors=True)
+        return (i_row, index, "error", None)
+
+    if verbose >= 4:
+        print(
+            f"{innerpad}  Moving {temp_path} to {destination}",
+            flush=True,
+        )
+    shutil.move(temp_path, str(destination))
+    shutil.rmtree(temp_subdir, ignore_errors=True)
+
+    return (i_row, index, "downloaded", destination.name)
+
+
+async def _download_images_async(
+    df,
+    output_dir,
+    skip_existing=True,
+    check_image=True,
+    verbose=1,
+    use_tqdm=True,
+    print_indent=0,
+    max_concurrent=DEFAULT_CONCURRENT_DOWNLOADS,
+):
+    """
+    Async implementation of image downloading with concurrency control.
+    """
+    t_start = time.time()
+
+    padding = " " * print_indent
+    innerpad = padding + "    "
+
+    if verbose >= 1:
+        jobs_msg = f" with {max_concurrent} concurrent downloads"
+        print(f"{padding}Downloading {len(df)} images{jobs_msg}", flush=True)
+
+    if verbose >= 3:
+        print(f"{padding}Sanitizing fields used to build filenames", flush=True)
+
+    df["dataset"] = benthicnet.io.sanitize_filename_series(df["dataset"])
+    df["site"] = benthicnet.io.sanitize_filename_series(df["site"])
+    df["image"] = df.apply(benthicnet.io.row2basename, axis=1)
+    df["url"] = df["url"].str.strip()
+
+    if verbose != 1:
+        use_tqdm = False
+
+    n_already_downloaded = 0
+    n_download = 0
+    n_error = 0
+
+    is_valid = np.zeros(len(df), dtype=bool)
+    image_names = [""] * len(df)
+
+    rate_limiter = DomainRateLimiter()
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def bounded_download(client, row, index, i_row, temp_dir):
+        async with semaphore:
+            return await _download_single_image(
+                client,
+                rate_limiter,
+                row,
+                index,
+                i_row,
+                output_dir,
+                temp_dir,
+                skip_existing,
+                check_image,
+                verbose,
+                innerpad,
+            )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=max_concurrent * 2),
+        ) as client:
+            # Create all download tasks
+            tasks = [
+                bounded_download(client, row, index, i_row, temp_dir)
+                for i_row, (index, row) in enumerate(df.iterrows())
+            ]
+
+            # Process with progress bar
+            results = []
+            for coro in tqdm.tqdm(
+                asyncio.as_completed(tasks),
+                total=len(tasks),
+                disable=not use_tqdm,
+                desc="Downloading",
+            ):
+                result = await coro
+                results.append(result)
+
+    # Process results
+    for i_row, index, status, dest_name in results:
+        if status == "already_exists":
+            n_already_downloaded += 1
+            is_valid[i_row] = True
+            image_names[i_row] = dest_name
+        elif status == "downloaded":
+            n_download += 1
+            is_valid[i_row] = True
+            image_names[i_row] = dest_name
+        else:  # error or skipped_url
+            n_error += 1
+
+    # Update dataframe with final image names
+    for i_row, (index, _) in enumerate(df.iterrows()):
+        if is_valid[i_row]:
+            df.at[index, "image"] = image_names[i_row]
+
+    if verbose >= 1:
+        elapsed = datetime.timedelta(seconds=int(time.time() - t_start))
+        print(
+            f"{padding}Finished processing {len(df)} images in {elapsed}.", flush=True
+        )
+
+        summary = _format_summary(n_already_downloaded, n_error, n_download, len(df))
+        if summary:
+            print(padding + summary, flush=True)
+
+    return df.loc[is_valid]
+
+
 def download_images_from_dataframe(
     df,
     output_dir,
@@ -278,6 +550,7 @@ def download_images_from_dataframe(
     verbose=1,
     use_tqdm=True,
     print_indent=0,
+    max_concurrent=DEFAULT_CONCURRENT_DOWNLOADS,
 ):
     """
     Download all images from a dataframe.
@@ -305,6 +578,8 @@ def download_images_from_dataframe(
     print_indent : int, optional
         Amount of whitespace padding to precede print statements.
         Default is ``0``.
+    max_concurrent : int, optional
+        Maximum number of concurrent downloads. Default is ``8``.
 
     Returns
     -------
@@ -314,130 +589,21 @@ def download_images_from_dataframe(
         which could be downloaded are included; URLs which could not be found
         are omitted.
     """
-    t_start = time.time()
-
-    padding = " " * print_indent
-    innerpad = padding + "    "
-
-    if verbose >= 1:
-        print(f"{padding}Downloading {len(df)} images", flush=True)
-
     if not inplace:
         df = df.copy()
 
-    if verbose >= 3:
-        print(f"{padding}Sanitizing fields used to build filenames", flush=True)
-
-    df["dataset"] = benthicnet.io.sanitize_filename_series(df["dataset"])
-    df["site"] = benthicnet.io.sanitize_filename_series(df["site"])
-    df["image"] = df.apply(benthicnet.io.row2basename, axis=1)
-    df["url"] = df["url"].str.strip()
-
-    if verbose != 1:
-        use_tqdm = False
-
-    n_already_downloaded = 0
-    n_download = 0
-    n_error = 0
-
-    t_download_start = time.time()
-    is_valid = np.zeros(len(df), dtype=bool)
-
-    # Use a session for connection pooling
-    session = requests.Session()
-
-    try:
-        for i_row, (index, row) in enumerate(
-            tqdm.tqdm(df.iterrows(), total=len(df), disable=not use_tqdm)
-        ):
-            url = row["url"]
-
-            # Handle missing URLs
-            if pd.isna(url) or url == "":
-                n_error += 1
-                if verbose >= 2:
-                    print(f"{innerpad}Missing URL for entry\n{row}", flush=True)
-                continue
-
-            destination = Path(output_dir) / row["dataset"] / row["site"] / row["image"]
-
-            # Print progress periodically when not using tqdm
-            should_print_progress = i_row > n_error and (
-                verbose >= 3
-                or (verbose >= 1 and not use_tqdm and (i_row <= 5 or i_row % 100 == 0))
-            )
-            if should_print_progress:
-                elapsed = time.time() - t_download_start
-                print(
-                    padding + _format_progress(i_row, len(df), elapsed, n_download),
-                    flush=True,
-                )
-
-            destination.parent.mkdir(parents=True, exist_ok=True)
-
-            if skip_existing and destination.is_file():
-                n_already_downloaded += 1
-                if verbose >= 3:
-                    print(
-                        f"{innerpad}Skipping download of {url}\n"
-                        f"{innerpad}Destination exists: {destination}",
-                        flush=True,
-                    )
-            else:
-                if verbose >= 2:
-                    print(f"{innerpad}Downloading {url} to {destination}", flush=True)
-
-                response = _download_with_retry(
-                    session, url, verbose=verbose, innerpad=innerpad
-                )
-
-                if response is None:
-                    n_error += 1
-                    continue
-
-                if response.status_code != 200:
-                    if verbose >= 1:
-                        print(
-                            f"{innerpad}Bad URL (HTTP Status {response.status_code}): "
-                            f"{url}"
-                        )
-                    n_error += 1
-                    continue
-
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    temp_path = _save_image_to_temp(
-                        response, url, temp_dir, verbose=verbose, innerpad=innerpad
-                    )
-
-                    if check_image and not _validate_image(temp_path, url):
-                        n_error += 1
-                        continue
-
-                    if verbose >= 4:
-                        print(
-                            f"{innerpad}  Moving {temp_path} to {destination}",
-                            flush=True,
-                        )
-                    shutil.move(temp_path, str(destination))
-                    n_download += 1
-
-            is_valid[i_row] = True
-            df.at[index, "image"] = destination.name
-
-    finally:
-        session.close()
-
-    if verbose >= 1:
-        elapsed = datetime.timedelta(seconds=int(time.time() - t_start))
-        print(
-            f"{padding}Finished processing {len(df)} images in {elapsed}.", flush=True
+    return asyncio.run(
+        _download_images_async(
+            df,
+            output_dir,
+            skip_existing=skip_existing,
+            check_image=check_image,
+            verbose=verbose,
+            use_tqdm=use_tqdm,
+            print_indent=print_indent,
+            max_concurrent=max_concurrent,
         )
-
-        summary = _format_summary(n_already_downloaded, n_error, n_download, len(df))
-        if summary:
-            print(padding + summary, flush=True)
-
-    return df.loc[is_valid]
+    )
 
 
 def download_images_from_csv(
@@ -447,8 +613,7 @@ def download_images_from_csv(
     output_csv=None,
     skip_existing=True,
     verbose=1,
-    i_proc=None,
-    n_proc=None,
+    max_concurrent=DEFAULT_CONCURRENT_DOWNLOADS,
     **kwargs,
 ):
     """
@@ -469,12 +634,8 @@ def download_images_from_csv(
         exist. Default is ``True``.
     verbose : int, optional
         Verbosity level. Default is ``1``.
-    i_proc : int or None, optional
-        Run on only a partition of the CSV file. If ``None`` (default), the
-        entire dataset will be downloaded by this process. Otherwise, ``n_proc``
-        must also be set.
-    n_proc : int or None, optional
-        Number of partitions being run. Default is ``None``.
+    max_concurrent : int, optional
+        Maximum number of concurrent downloads. Default is ``8``.
     **kwargs : optional
         Additional arguments as per :func:`download_images_from_dataframe``.
 
@@ -484,30 +645,10 @@ def download_images_from_csv(
     """
     t_start = time.time()
 
-    if (i_proc is not None) != (n_proc is not None):
-        raise ValueError(
-            "Both i_proc and n_proc must be defined when partitioning the CSV file."
-        )
-
-    skiprows = []
-    start_idx = 0
-    end_idx = 0
-    part_str = ""
-
-    if n_proc is not None and i_proc is not None:
-        part_str = f"(part {i_proc} of {n_proc})"
-        n_lines = benthicnet.io.count_lines(input_csv) - 1
-        partition_size = n_lines / n_proc
-        proc_idx = 0 if i_proc == n_proc else i_proc
-        start_idx = round(proc_idx * partition_size)
-        end_idx = round((proc_idx + 1) * partition_size)
-        skiprows = list(range(1, 1 + start_idx)) + list(range(1 + end_idx, 1 + n_lines))
-
     if verbose >= 1:
-        count_str = "all" if n_proc is None else str(end_idx - start_idx)
-        part_info = "" if n_proc is None else f"{part_str} "
-        print(f"Will download {count_str} images {part_info}listed in {input_csv}")
+        print(f"Will download all images listed in {input_csv}")
         print(f"To output directory {output_dir}")
+        print(f"Using {max_concurrent} concurrent downloads")
 
         if skip_existing:
             print("Existing outputs will be skipped.")
@@ -524,7 +665,7 @@ def download_images_from_csv(
 
         print(f"Reading CSV file ({benthicnet.io.file_size(input_csv)})...", flush=True)
 
-    df = benthicnet.io.read_csv(input_csv, skiprows=skiprows)
+    df = benthicnet.io.read_csv(input_csv)
 
     if verbose >= 1:
         print(f"Loaded CSV file in {time.time() - t_start:.1f} seconds", flush=True)
@@ -535,6 +676,7 @@ def download_images_from_csv(
         *args,
         skip_existing=skip_existing,
         verbose=verbose,
+        max_concurrent=max_concurrent,
         **kwargs,
     )
 
@@ -580,7 +722,7 @@ def get_parser():
         "--version",
         "-V",
         action="version",
-        version=f"%(prog)s {__meta__.version}",
+        version=f"%(prog)s {__version__}",
         help="Show program's version number and exit.",
     )
     parser.add_argument(
@@ -599,25 +741,19 @@ def get_parser():
         help="Output CSV file.",
     )
     parser.add_argument(
+        "-j",
+        "--jobs",
+        dest="max_concurrent",
+        metavar="N",
+        type=int,
+        default=DEFAULT_CONCURRENT_DOWNLOADS,
+        help="Number of concurrent downloads. Default is %(default)s.",
+    )
+    parser.add_argument(
         "--no-progress-bar",
         dest="use_tqdm",
         action="store_false",
         help="Disable tqdm progress bar.",
-    )
-    parser.add_argument(
-        "--nproc",
-        dest="n_proc",
-        metavar="NPROC",
-        type=int,
-        help="Number of processing partitions being run.",
-    )
-    parser.add_argument(
-        "--iproc",
-        "--proc",
-        dest="i_proc",
-        metavar="IPROC",
-        type=int,
-        help="Partition index for this process.",
     )
     parser.add_argument(
         "--clobber",

@@ -12,7 +12,7 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 import benthicnet.io
-from benthicnet import __meta__
+from benthicnet import __version__
 
 
 def tar2tar(tar_dir_source, tar_dir_dest, csv_source, csv_dest, verbose=1):
@@ -198,7 +198,7 @@ def get_parser():
         "--version",
         "-V",
         action="version",
-        version="%(prog)s {version}".format(version=__meta__.version),
+        version=f"%(prog)s {__version__}",
         help="Show program's version number and exit.",
     )
     parser.add_argument(
