@@ -1,3 +1,67 @@
 [build-system]
-requires = ["setuptools", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "benthicnet"
+version = "0.1.0"
+description = "Dataset for underwater benthic imagery of the seafloor"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Scott C. Lowe", email = "scott.code.lowe@gmail.com" },
+]
+classifiers = [
+    "Natural Language :: English",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "haversine>=2.9.0",
+    "numpy>=2.4.1",
+    "pandas>=1.0.0",
+    "pillow>=12.1.0",
+    "requests>=2.32.5",
+    "scikit-learn>=1.8.0",
+    "tqdm>=4.67.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black==23.1.0",
+    "identify>=1.4.20",
+    "pre-commit>=4.5.1",
+]
+docs = [
+    "myst-parser>=1.0.0",
+    "pypandoc>=1.6.3",
+    "readthedocs-sphinx-search>=0.3.2",
+    "sphinx>=3.5.4,<6",
+    "sphinx-argparse>=0.5.2",
+    "sphinx-autobuild>=2025.8.25",
+    "sphinx-book-theme>=1.1.3",
+]
+plot = [
+    "cartopy>=0.25.0",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.8",
+    "seaborn>=0.13.2",
+]
+all = [
+    "benthicnet[dev,docs,plot]",
+]
+
+[project.urls]
+Homepage = "https://github.com/DalhousieAI/BenthicNet"
+Repository = "https://github.com/DalhousieAI/BenthicNet"
+
+[project.scripts]
+benthicnet-download = "benthicnet.download_images:main"
+benthicnet-download-tar = "benthicnet.download_images_tar:main"
+benthicnet-convert-tar = "benthicnet.convert_images_tar:main"
+benthicnet-subsample = "benthicnet.subsample:main"
+benthicnet-tar2tar = "benthicnet.tar2tar:main"
