@@ -2,13 +2,11 @@
 # coding: utf-8
 
 import functools
-import os
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import sklearn.neighbors
-from tqdm.auto import tqdm
 
 import benthicnet.io
 import benthicnet.plotting
@@ -637,11 +635,13 @@ def partition_dataset(
                 )
             )
             # Record the closest distance to a partition focii
-            df.loc[
-                df.index.values[neighbours[0]], "_dist_from_" + partition_name
-            ] = np.minimum(
-                df.loc[df.index.values[neighbours[0]], "_dist_from_" + partition_name],
-                dist[0],
+            df.loc[df.index.values[neighbours[0]], "_dist_from_" + partition_name] = (
+                np.minimum(
+                    df.loc[
+                        df.index.values[neighbours[0]], "_dist_from_" + partition_name
+                    ],
+                    dist[0],
+                )
             )
             extra_txt = " (of neighbours)" if partition_radius else ""
             if verbosity >= 4:
@@ -901,11 +901,13 @@ def partition_dataset(
                 )
             )
             # Record the closest distance to a partition focii
-            df.loc[
-                df.index.values[neighbours[0]], "_dist_from_" + partition_name
-            ] = np.minimum(
-                df.loc[df.index.values[neighbours[0]], "_dist_from_" + partition_name],
-                dist[0],
+            df.loc[df.index.values[neighbours[0]], "_dist_from_" + partition_name] = (
+                np.minimum(
+                    df.loc[
+                        df.index.values[neighbours[0]], "_dist_from_" + partition_name
+                    ],
+                    dist[0],
+                )
             )
             if verbosity >= 4:
                 print(
@@ -964,11 +966,13 @@ def partition_dataset(
                 )
             )
             # Record the closest distance to a partition focii
-            df.loc[
-                df.index.values[neighbours[0]], "_dist_from_" + partition_name
-            ] = np.minimum(
-                df.loc[df.index.values[neighbours[0]], "_dist_from_" + partition_name],
-                dist[0],
+            df.loc[df.index.values[neighbours[0]], "_dist_from_" + partition_name] = (
+                np.minimum(
+                    df.loc[
+                        df.index.values[neighbours[0]], "_dist_from_" + partition_name
+                    ],
+                    dist[0],
+                )
             )
             df.loc[df.index.values[neighbours[0]], "_dist_from_any"] = np.minimum(
                 df.loc[df.index.values[neighbours[0]], "_dist_from_any"],

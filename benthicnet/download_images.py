@@ -362,16 +362,9 @@ def download_images_from_dataframe(
             destination = Path(output_dir) / row["dataset"] / row["site"] / row["image"]
 
             # Print progress periodically when not using tqdm
-            should_print_progress = (
-                i_row > n_error
-                and (
-                    verbose >= 3
-                    or (
-                        verbose >= 1
-                        and not use_tqdm
-                        and (i_row <= 5 or i_row % 100 == 0)
-                    )
-                )
+            should_print_progress = i_row > n_error and (
+                verbose >= 3
+                or (verbose >= 1 and not use_tqdm and (i_row <= 5 or i_row % 100 == 0))
             )
             if should_print_progress:
                 elapsed = time.time() - t_download_start
@@ -436,7 +429,9 @@ def download_images_from_dataframe(
 
     if verbose >= 1:
         elapsed = datetime.timedelta(seconds=int(time.time() - t_start))
-        print(f"{padding}Finished processing {len(df)} images in {elapsed}.", flush=True)
+        print(
+            f"{padding}Finished processing {len(df)} images in {elapsed}.", flush=True
+        )
 
         summary = _format_summary(n_already_downloaded, n_error, n_download, len(df))
         if summary:
@@ -527,9 +522,7 @@ def download_images_from_csv(
             if os.path.isfile(output_csv):
                 print(f"The existing file {output_csv} will be overwritten.")
 
-        print(
-            f"Reading CSV file ({benthicnet.io.file_size(input_csv)})...", flush=True
-        )
+        print(f"Reading CSV file ({benthicnet.io.file_size(input_csv)})...", flush=True)
 
     df = benthicnet.io.read_csv(input_csv, skiprows=skiprows)
 

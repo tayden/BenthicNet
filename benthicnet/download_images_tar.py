@@ -5,7 +5,6 @@ Downloading BenthicNet images from CSV file to tarfiles.
 """
 
 import datetime
-import functools
 import os
 import sys
 import tarfile

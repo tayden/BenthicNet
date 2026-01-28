@@ -4,7 +4,6 @@
 Convert images in a tarball into smaller JPEGs, in a new tarball.
 """
 
-import copy
 import datetime
 import os
 import pathlib

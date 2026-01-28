@@ -7,7 +7,6 @@ Move files from tarball of images to another, by matching on URL.
 import copy
 import os
 import tarfile
-import time
 
 import pandas as pd
 from tqdm.auto import tqdm
